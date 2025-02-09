@@ -1,76 +1,131 @@
-from datetime import datetime
-from langchain.agents import initialize_agent, AgentType
-from langchain.llms import OpenAI
-from langchain.agents import Tool
-
-# Define the custom function to get the current time
-def get_current_time():
-    """Returns the current time as a string in HH:MM:SS format."""
-    return datetime.now().strftime("%H:%M:%S")
-
-# Define the custom function to get the current date
-def get_current_date():
-    """Returns the current date as a string in YYYY-MM-DD format."""
-    return datetime.now().strftime("%Y-%m-%d")
-
-# Create tools for the time and date functions
-current_time_tool = Tool(
-    name="CurrentTime",
-    func=get_current_time,
-    description="Use this tool to get the current time."
+from dotenv import load_dotenv
+from langchain import hub
+from langchain.agents import (
+    AgentExecutor,
+    create_react_agent,
 )
+from langchain_core.tools import Tool, tool
+from langchain.chat_models import AzureChatOpenAI
+from langchain_core.prompts import PromptTemplate
+import csv
+import pandas as pd
+import psycopg2
 
-current_date_tool = Tool(
-    name="CurrentDate",
-    func=get_current_date,
-    description="Use this tool to get the current date."
-)
+# Load environment variables from .env file
+load_dotenv()
 
-# Set up the LangChain LLM (you can replace this with your LLM model, such as OpenAI's GPT)
-llm = OpenAI(openai_api_key="you_api_key", temperature=0.7)
+def get_current_time(*args, **kwargs):
+    """Returns the current time in H:MM AM/PM format."""
+    import datetime  # Import datetime module to get current time
 
-# Set up the agent with the time and date tools
-tools = [current_time_tool, current_date_tool]
-agent = initialize_agent(tools, llm, agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
+    now = datetime.datetime.now()  # Get current time
+    return now.strftime("%I:%M %p")  # Format time in H:MM AM/PM format
 
-# Function to check if the user's question is about the current time or date
-def is_time_or_date_related_question(user_input):
-    """Check if the user's question is related to time or date."""
-    time_keywords = ["time", "hour", "clock", "current time", "what time is it"]
-    date_keywords = ["date", "today", "current date", "what's the date", "what is today's date"]
-    
-    if any(keyword.lower() in user_input.lower() for keyword in time_keywords):
-        return "time"
-    elif any(keyword.lower() in user_input.lower() for keyword in date_keywords):
-        return "date"
-    else:
-        return None
+def connect_to_database(*args, **kwargs):
+    conn = psycopg2.connect(
+        host="your_db_host",
+        database="your_db_name",
+        user="username",
+        password="password",
+        port='5432'
+    )
+    print("Connected to database successfully")
 
-# Define the function to interact with the agent
-def get_agent_response(user_input):
-    """Uses the LangChain agent to get a response based on the user's input."""
-    # Check if the question is related to time or date
-    category = is_time_or_date_related_question(user_input)
-    
-    if category == "time":
-        # Call the time tool to get the current time
-        return current_time_tool.func()
-    elif category == "date":
-        # Call the date tool to get the current date
-        return current_date_tool.func()
-    else:
-        # If not time or date-related, pass the input to the agent for general response
-        return agent.run(user_input)
+    return conn
 
-# Example of usage:
+def execute_query(query, *args, **kwargs):
+    conn = connect_to_database()
+    cursor = conn.cursor()
+    cursor.execute(query)
+    resp = cursor.fetchall()
+    cursor.close()
+
+    return resp
+
+# List of tools available to the agent
+tools = [
+    Tool(
+        name="Time",  # Name of the tool
+        func=get_current_time,  # Function that the tool will execute
+        # Description of the tool
+        description="Useful for when you need to know the current time",
+    ),
+    Tool(
+        name="database connect",  # Name of the tool
+        func=connect_to_database,  # Function that the tool will execute
+        # Description of the tool
+        description="Useful for querying the SQL database to retrieve information"
+    ),
+    Tool(
+        name="database query",  # Name of the tool
+        func=execute_query,  # Function that the tool will execute
+        # Description of the tool
+        description="Useful for querying the SQL database to retrieve information. Only query from table public.result. The table contains id, regression_id, test_id, test_name, args, ran, result, duration, host_message, sut_message, error_line_count, timeout, setting, category, tst, jira_ticket, test_category, test_check, jira_status, usr_comment and updated.  Consindering the 'invalid' column. If it is invalid, do not take into account"
+    )
+]
+
+class Agent:
+    def __init__(self):
+        # ReAct = Reason and Action
+        # https://smith.langchain.com/hub/hwchase17/react
+        template = """
+        Answer the following questions as best you can. You have access to the following tools:
+        {tools}
+
+        Use the following format:
+
+        Question: the input question you must answer
+        Thought: you should always think about what to do
+        Action: the action to take, should be one of [{tool_names}]
+        Action Input: the input to the action
+        Observation: the result of the action
+        ... (this Thought/Action/Action Input/Observation can repeat N times)
+        Thought: I now know the final answer. Make sure resolve this error psycopg2.errors.SyntaxError: unterminated quoted identifier at or near "" when dealing with psycopg2 database query. Should elimminate closing double quote at the end of the prompt
+        Final Answer: the final answer to the original input question
+
+        Begin!
+
+        Question: {input}
+        Thought:{agent_scratchpad}
+        """
+
+        self.prompt = PromptTemplate.from_template(template)
+        
+        # Initialize a ChatOpenAI model
+        llm = AzureChatOpenAI(
+            deployment_name='swe-gpt4o-exp1', 
+            temperature=0, 
+            openai_api_version="2024-02-01", 
+            openai_api_base="https://llm-api.amd.com", 
+            openai_api_key="your_api_key", 
+            model_kwargs = {
+                'headers': { 
+                    "Ocp-Apim-Subscription-Key": "f204857bfd0d46dc99335c36e406b066"
+                }
+                }
+            )
+
+        # Create the ReAct agent using the create_react_agent function
+        self.agent = create_react_agent(
+            llm=llm,
+            tools=tools,
+            prompt=self.prompt,
+            stop_sequence=True,
+        )
+
+        # Create an agent executor from the agent and tools
+        self.agent_executor = AgentExecutor.from_agent_and_tools(
+            agent=self.agent,
+            tools=tools,
+            verbose=True,
+        )
+
+
 if __name__ == "__main__":
-    while True:
-        # Ask the user for input (this could be a question or any text)
-        user_input = input("Ask me anything (type 'exit' to stop): ")
-        
-        if user_input.lower() == 'exit':
-            break
-        
-        # Get the agent's response
-        response = get_agent_response(user_input)
-        print(f"Response: {response}")
+    # Run the agent with a test query
+    agentApi = Agent()
+    
+    response = agentApi.agent_executor.invoke({"input": "Can you summarise the result column for regression id 54097? "})
+
+    # Print the response from the agent
+    print("response:", response['output'])
